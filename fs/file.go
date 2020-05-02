@@ -2,6 +2,8 @@ package fs
 
 import (
 	"bytes"
+	"hash"
+	"hash/crc32"
 	"io"
 	"io/ioutil"
 	"os"
@@ -84,6 +86,15 @@ func NewFile(path string) (*File, error) {
 	}, nil
 }
 
+type checksumReader struct {
+	rc    io.ReadCloser
+	hash  hash.Hash32
+	nread uint64 // number of bytes read so far
+	f     *File
+	desr  io.Reader // if non-nil, where to read the data descriptor
+	err   error     // sticky error
+}
+
 // Open opens the file for reading. If successful, methods on
 // the returned file can be used for reading.
 func (f *File) Open() error {
@@ -95,7 +106,7 @@ func (f *File) Open() error {
 
 	f.buffer = bytes.NewBuffer(f.Data)
 	f.rdi = 0
-	return nil
+	return f
 }
 
 // Read reads the next len(p) bytes from the buffer or until the buffer

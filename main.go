@@ -1,15 +1,19 @@
 package main
 
 import (
+	"aletheia.icu/broccoli/data"
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
+	"bazil.org/fuse/fuseutil"
 	"context"
 	"flag"
 	"fmt"
 	bfs "github.com/demonoid81/broccolicompile/fs"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -21,21 +25,55 @@ func usage() {
 }
 
 func main() {
-	//log.SetFlags(0)
-	//log.SetPrefix(progName + ": ")git commit -m "first commit"
-	//git remote add origin git@github.com:demonoid81/broccolicompile.git
-	//git push -u origin master
-	//
-	//flag.Usage = usage
-	//flag.Parse()
-	//
-	//if flag.NArg() != 1 {
-	//	usage()
-	//	os.Exit(2)
-	//}
-	if err := mount("/mnt"); err != nil {
+	log.SetFlags(0)
+	log.SetPrefix(progName + ": ")
+
+	flag.Usage = usage
+	flag.Parse()
+
+	if flag.NArg() != 1 {
+		usage()
+		os.Exit(2)
+	}
+
+	go func() {
+		var appTime time.Time
+		interrupt := make(chan os.Signal,1)
+		signal.Notify(interrupt, os.Interrupt)
+
+		done := make(chan struct{})
+
+		ticker := time.NewTicker(15 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <- ticker.C:
+				if appTime.Before(time.Now()) {
+					fuse.Unmount(flag.Arg(0))
+					select {
+					case <-done:
+					case <-time.After(time.Second):
+					}
+					return
+				}
+				appTime = time.Now()
+			case <- interrupt:
+				log.Println("interput")
+				fuse.Unmount(flag.Arg(0))
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+				}
+				return
+			}
+		}
+	}()
+
+	if err := mount(flag.Arg(0)); err != nil {
 		log.Fatal(err)
 	}
+
 }
 
 type FS struct {
@@ -46,7 +84,7 @@ var _ fs.FS = (*FS)(nil)
 
 type Dir struct {
 	files *bfs.Broccoli
-	file *bfs.File
+	file  *bfs.File
 }
 
 func (f *FS) Root() (fs.Node, error) {
@@ -59,12 +97,7 @@ func (f *FS) Root() (fs.Node, error) {
 var _ fs.Node = (*Dir)(nil)
 
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
-	if d.file == nil {
-		// root directory
-		a.Mode = os.ModeDir | 0755
-		return nil
-	}
-	fileAttr(d.file, a)
+	a.Mode = os.ModeDir | 0755
 	return nil
 }
 
@@ -85,7 +118,7 @@ func mount(mountpoint string) error {
 	defer c.Close()
 
 	filesystem := &FS{
-		files: broccoli,
+		files: data.Broccoli,
 	}
 	if err := fs.Serve(c, filesystem); err != nil {
 		return err
@@ -106,18 +139,17 @@ var _ = fs.NodeRequestLookuper(&Dir{})
 func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
 	path := req.Name
 	if d.file != nil {
-		path = d.file.Name() + path
+		path = d.file.Fpath + "/" + path
 	}
-	fmt.Println(path)
 	for _, f := range d.files.Files {
-		var name = f.Name()
+		var name = f.Fpath
 		switch {
-		case name == path:
+		case !f.IsDir() && name == path:
 			child := &File{
 				file: f,
 			}
 			return child, nil
-		case name[:len(name)-1] == path && name[len(name)-1] == '/':
+		case f.IsDir() && name == path:
 			child := &Dir{
 				files: d.files,
 				file:    f,
@@ -131,34 +163,39 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 var _ = fs.HandleReadDirAller(&Dir{})
 
 func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	//prefix := ""
-	//if d.file != nil {
-	//	prefix = d.file.Name()
-	//}
-
+	prefix := ""
+	if d.file != nil {
+		prefix = d.file.Fpath
+	}
 	var res []fuse.Dirent
-	//for _, f := range d.files.Files {
-	//	if !strings.HasPrefix(f.Name(), prefix) {
-	//		continue
-	//	}
-	//	name := f.Name()[len(prefix):]
-	//	if name == "" {
-	//		// the dir itself, not a child
-	//		continue
-	//	}
-	//	if strings.ContainsRune(name[:len(name)-1], '/') {
-	//		// contains slash in the middle -> is in a deeper subdir
-	//		continue
-	//	}
-	//	var de fuse.Dirent
-	//	if name[len(name)-1] == '/' {
-	//		// directory
-	//		name = name[:len(name)-1]
-	//		de.Type = fuse.DT_Dir
-	//	}
-	//	de.Name = name
-	//	res = append(res, de)
-	//}
+	for _, f := range d.files.Files {
+		if !strings.HasPrefix(f.Fpath, prefix) {
+			continue
+		}
+
+		p1arr := strings.Split(f.Fpath, "/")
+		p2arr := strings.Split(prefix, "/")
+
+		if len(p1arr)-len(p2arr) == 1 && len(prefix) > 0 {
+			var de fuse.Dirent
+			if f.IsDir() {
+				de.Type = fuse.DT_Dir
+			} else {
+				de.Type = fuse.DT_File
+			}
+			de.Name = f.Fname
+			res = append(res, de)
+		} else if prefix == "" && len(p1arr) == 1 {
+			var de fuse.Dirent
+			if f.IsDir() {
+				de.Type = fuse.DT_Dir
+			} else {
+				de.Type = fuse.DT_File
+			}
+			de.Name = f.Fname
+			res = append(res, de)
+		}
+	}
 	return res, nil
 }
 
@@ -168,43 +205,34 @@ type File struct {
 
 var _ fs.Node = (*File)(nil)
 
+var _ fs.Handle = (*File)(nil)
+
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	fileAttr(f.file, a)
 	return nil
 }
-//
-//var _ = fs.NodeOpener(&File{})
-//
-//func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
-//	r, err := f.file.Open()
-//	if err != nil {
-//		return nil, err
-//	}
-//	//// individual entries inside a zip file are not seekable
-//	resp.Flags |= fuse.OpenNonSeekable
-//	return &FileHandle{r: r}, nil
-//}
-//
-//type FileHandle struct {
-//	r io.ReadCloser
-//}
-//
-//var _ fs.Handle = (*FileHandle)(nil)
-//
-//var _ fs.HandleReleaser = (*FileHandle)(nil)
-//
-//func (fh *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
-//	return fh.r.Close()
-//}
-//
-//var _ = fs.HandleReader(&FileHandle{})
-//
-//func (fh *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-//	buf := make([]byte, req.Size)
-//	n, err := io.ReadFull(fh.r, buf)
-//	if err == io.ErrUnexpectedEOF || err == io.EOF {
-//		err = nil
-//	}
-//	resp.Data = buf[:n]
-//	return err
-//}
+
+var _ = fs.NodeOpener(&File{})
+
+func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+	err := f.file.Open()
+	if err != nil {
+		return nil, err
+	}
+	//// individual entries inside a zip file are not seekable
+	resp.Flags |= fuse.OpenNonSeekable
+	return f, nil
+}
+
+var _ fs.HandleReleaser = (*File)(nil)
+
+func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
+	return nil
+}
+
+var _ fs.HandleReader = (*File)(nil)
+
+func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+	fuseutil.HandleRead(req,resp,f.file.Data)
+	return nil
+}
